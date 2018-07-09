@@ -2,6 +2,7 @@
 #include "iio.h"        // image i/o
 
 #include <stdlib.h>
+#include <stdbool.h>
 #include <math.h>       // nans (used as boundary value by bicubic interp)
 #include <fftw3.h>      // computes dct
 #include <omp.h>
@@ -465,7 +466,9 @@ struct nlkalman_params
 	float dista_lambda;  // weight of current frame in patch distance
 	float beta_x;        // noise multiplier in spatial filtering
 	float beta_t;        // noise multiplier in kalman filtering
-	bool pixelwise;      // toggle pixel-wise nlmeans
+	int pixelwise;       // toggle pixel-wise nlmeans
+	int blur;            // toggle blur-aware fusion
+	float p;             // blur parameter
 };
 
 // set default parameters as a function of sigma
@@ -526,6 +529,7 @@ void nlkalman_frame(float *deno1, float *nisy1, float *deno0,
 	const float dista_th2 = prms.dista_th * prms.dista_th;
 	const float beta_x  = prms.beta_x;
 	const float beta_t  = prms.beta_t;
+	const int blur = prms.blur;
 
 	// aggregation weights (not necessary for pixel-wise nlmeans)
 	float *aggr1 = prms.pixelwise ? NULL : malloc(w*h*sizeof(float));
@@ -569,6 +573,72 @@ void nlkalman_frame(float *deno1, float *nisy1, float *deno0,
 	float V01[ch][psz][psz]; // transition variance from t-1 to t
 	float M1 [ch][psz][psz]; // average patch at t
 	float V1 [ch][psz][psz]; // variance at t
+
+	float B1[psz][psz];	 // relative blur between noisy at t and denoised at t-1
+
+	// compute blur weights between the two frames [[[2
+	if (deno0 && blur) {
+		struct dct_threads blurdct[1];
+		// compute the full frame dct [[[3
+		dct_threads_init(w, h, 1, 1, 1, blurdct);
+		float* _nisy1 = malloc(w*h*sizeof(float));
+		float* _deno0 = malloc(w*h*sizeof(float));
+		for (int i = 0; i < w*h; i++) {
+			float sum = 0.f;
+			for (int j = 0; j < ch; j++)
+				sum += nisy1[i*ch+j];
+			_nisy1[i] = sum / ch;
+		}
+		for (int i = 0; i < w*h; i++) {
+			float sum = 0.f;
+			for (int j = 0; j < ch; j++)
+				sum += deno0[i*ch+j];
+			_deno0[i] = sum / ch;
+			if (isnan(_deno0[i])) {
+				_deno0[i] = _nisy1[i];
+			}
+		}
+		dct_threads_forward(_nisy1, blurdct);
+		dct_threads_forward(_deno0, blurdct);
+
+		// resize the dct to patch size [[[3
+		float _fdeno0[psz][psz];
+		float _fnisy1[psz][psz];
+		for (int x = 0; x < psz; x++) {
+			for (int y = 0; y < psz; y++) {
+				_fdeno0[x][y] = 0.f;
+				_fnisy1[x][y] = 0.f;
+			}
+		}
+		for (int x = 0; x < w; x++) {
+			for (int y = 0; y < h; y++) {
+				int ox = (int)((float)x / w * psz);
+				int oy = (int)((float)y / h * psz);
+				_fdeno0[ox][oy] += fabsf(_deno0[x+y*w]);
+				_fnisy1[ox][oy] += fmax(0., fabsf(_nisy1[x+y*w]) - sigma);
+			}
+		}
+
+		// compute the blur weights [[[3
+		for (int x = 0; x < psz; x++) {
+			for (int y = 0; y < psz; y++) {
+				float w0 = powf(_fdeno0[x][y], prms.p);
+				float w1 = powf(_fnisy1[x][y], prms.p);
+				B1[x][y] = w1 / (w0 + w1 + 1e-6);
+			}
+		}
+
+		dct_threads_destroy(blurdct);
+		free(_nisy1); free(_deno0);
+	} else {
+		// if there is no previous frame, initialize the weights to 0.5
+		for (int x = 0; x < psz; x++) {
+			for (int y = 0; y < psz; y++) {
+				B1[x][y] = .5f;
+			}
+		}
+	}
+	//]]]
 
 	// loop on image patches [[[2
 	for (int oy = 0; oy < psz; oy += step) // split in grids of non-overlapping
@@ -773,6 +843,12 @@ void nlkalman_frame(float *deno1, float *nisy1, float *deno0,
 
 				// kalman gain
 				float a = v / (v + beta_t * sigma2);
+
+				// blur factor
+				if (blur) {
+					a = fminf(a * B1[hx][hy] * 2, 1.f);
+				}
+
 				if (a < 0) printf("a = %f v = %f ", a, v);
 				if (a > 1) printf("a = %f v = %f ", a, v);
 
@@ -884,6 +960,8 @@ int main(int argc, const char *argv[])
 	prms.beta_t       = -1.;
 	prms.dista_lambda = -1.;
 	prms.pixelwise = false;
+	prms.blur = 0;
+	prms.p = 5.f;
 
 	// configure command line parser
 	struct argparse_option options[] = {
@@ -903,6 +981,8 @@ int main(int argc, const char *argv[])
 		OPT_FLOAT  ( 0 , "beta_t", &prms.beta_t, "noise multiplier in kalman filtering"),
 		OPT_FLOAT  ( 0 , "lambda", &prms.dista_lambda, "noisy patch weight in patch distance"),
 		OPT_BOOLEAN( 0 , "pixel" , &prms.pixelwise, "toggle pixel-wise denoising"),
+		OPT_BOOLEAN( 0 , "blur"	 , &prms.blur, "toggle blur-aware fusion"),
+		OPT_FLOAT  ( 0 , "p"	 , &prms.p, "noisy patch weight in patch distance"),
 		OPT_GROUP("Program options"),
 		OPT_BOOLEAN('v', "verbose", &verbose, "verbose output"),
 		OPT_END(),
@@ -929,6 +1009,7 @@ int main(int argc, const char *argv[])
 		printf("\tlambda    %g\n", prms.dista_lambda);
 		printf("\tbeta_x    %g\n", prms.beta_x);
 		printf("\tbeta_t    %g\n", prms.beta_t);
+		printf("\tblur	    %d %f\n", prms.blur, prms.p);
 		printf("\n");
 #ifdef WEIGHTED_AGGREGATION
 		printf("\tWEIGHTED_AGGREGATION ON\n");
